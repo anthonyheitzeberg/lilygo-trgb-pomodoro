@@ -26,7 +26,7 @@ extern "C" {
 #endif
 
 /** Font scale factor. 1 = 8×8 px, 4 = 32×32 px per glyph. */
-#define FONT_SCALE 6
+#define FONT_SCALE 4
 
 /** Glyph width/height in screen pixels after scaling */
 #define GLYPH_W (8 * FONT_SCALE)

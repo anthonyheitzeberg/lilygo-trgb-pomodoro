@@ -162,7 +162,7 @@ static const lcd_reg_t ST7701S_INIT[] = {
 
     /* ── Page 0: standard MIPI commands ────────────────────────────── */
     {0xFF, {0x77,0x01,0x00,0x00,0x00}, 0x05},
-    {0x36, {0x08},                      0x01},  /* Memory Access Ctrl */
+    {0x36, {0x48},                      0x01},  /* Memory Access Ctrl: MX + BGR */
     {0x3A, {0x66},                      0x01},  /* Pixel format: RGB666 on-wire
                                                  *   (ESP32 sends 16-bit / RGB565
                                                  *    but the physical bus is 18-bit.
