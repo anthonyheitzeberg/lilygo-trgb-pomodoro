@@ -2,11 +2,14 @@
 
 /**
  * @file input.h
- * @brief Debounced GPIO button input handler.
+ * @brief Single-button input handler (short press / long press).
  *
- * The LILYGO T-RGB board has two physical buttons:
- *   - BTN_START_PAUSE  → calls pomo_start_pause()
- *   - BTN_RESET        → calls pomo_reset()
+ * The LILYGO T-RGB board effectively exposes one usable user button:
+ * GPIO 0 (BOOT). Other candidate GPIOs are consumed by the RGB display bus.
+ *
+ * Action mapping:
+ *   - Short press (< LONG_PRESS_MS)  → pomo_start_pause()
+ *   - Long press  (>= LONG_PRESS_MS) → pomo_reset()
  *
  * Debouncing strategy: software debounce via a FreeRTOS task that samples
  * GPIO every 10 ms. When a button transitions from high→low (active-low
@@ -30,10 +33,15 @@
 extern "C" {
 #endif
 
-/** GPIO numbers for the two buttons on the LILYGO T-RGB board.
- *  Adjust if your board revision differs. */
-#define BTN_START_PAUSE_GPIO  0   ///< Boot button doubles as Start/Pause
-#define BTN_RESET_GPIO        14  ///< Side button = Reset
+/** The LILYGO T-RGB has one physical button: the BOOT button (GPIO 0).
+ *  Every other GPIO is consumed by the RGB data bus or the I2C expander.
+ *
+ *  We map both actions to the single button using press duration:
+ *    Short press  (< LONG_PRESS_MS)  → Start / Pause
+ *    Long press   (≥ LONG_PRESS_MS)  → Reset
+ */
+#define BTN_GPIO          0     ///< GPIO 0 — the physical BOOT button
+#define LONG_PRESS_MS   800     ///< Hold ≥ 800 ms to trigger reset
 
 /**
  * @brief Initialise the input subsystem and start the polling task.

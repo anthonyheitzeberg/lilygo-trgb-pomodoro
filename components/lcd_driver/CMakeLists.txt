@@ -1,11 +1,14 @@
 idf_component_register(
     SRCS
+        "xl9555.c"
         "st7701s.c"
         "lcd_panel.c"
     INCLUDE_DIRS
         "."
     REQUIRES
-        driver          # esp_lcd, gpio, spi_master live here
-        esp_lcd         # esp_lcd_panel_rgb and friends
+        driver
+        esp_lcd
+        esp_driver_i2c
+        freertos
         log
 )

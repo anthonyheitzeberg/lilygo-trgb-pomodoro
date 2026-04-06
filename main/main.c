@@ -1,45 +1,48 @@
 /**
  * @file main.c
- * @brief Application entry point.
+ * @brief Application entry point for the Pomodoro Timer.
  *
- * app_main() is ESP-IDF's equivalent of main() — it runs after the
- * RTOS scheduler has started, so FreeRTOS APIs are safe to call here.
+ * ── Startup order ────────────────────────────────────────────────────────────
  *
- * Responsibility of this file: initialise every subsystem in the correct
- * order, then launch the display task. That's it — no logic lives here.
+ *   The order below is mandatory — skipping or rearranging steps causes hangs
+ *   or blank screens:
  *
- * Startup order matters:
- *   1. LCD hardware init (SPI init sequence — must happen before RGB DMA)
- *   2. RGB panel init  (DMA starts, framebuffer allocated)
- *   3. Pomodoro logic  (esp_timer created — RTOS must be running)
- *   4. Input handler   (buttons configured, polling task spawned)
- *   5. Display task    (starts rendering loop)
+ *   1. xl9555_init()    — bring up the I2C GPIO expander that controls the
+ *                          LCD's SPI reset/CS/MOSI/SCLK lines and the power
+ *                          rail enable pin.
+ *   2. st7701s_init()   — send the ~80-register ST7701S init sequence via
+ *                          XL9555 bit-bang SPI, then enable the backlight.
+ *   3. lcd_panel_init() — start the ESP32-S3 RGB DMA engine. The DMA reads
+ *                          the framebuffer continuously from PSRAM; it must
+ *                          start AFTER the LCD controller is awake.
+ *   4. display_clear()  — flood-fill the framebuffer so the first frame
+ *                          shown is white, not garbage from uninitialised PSRAM.
+ *   5. pomo_init()      — create the 1-second esp_timer (RTOS must be running).
+ *   6. input_init()     — configure GPIO 0 button and start polling task.
+ *   7. xTaskCreate()    — launch the display rendering loop.
  *
- * ──────────────────────────────────────────────────────────────────────────
- * LILYGO T-RGB 2.1" pin map (ESP32-S3R8)
- * ──────────────────────────────────────────────────────────────────────────
- * SPI (command bus)
- *   CS    → GPIO 39
- *   SCLK  → GPIO 48
- *   MOSI  → GPIO 47
- * Reset   → GPIO 40
- * BL      → GPIO 46  (backlight)
+ * ── LILYGO T-RGB 2.1" hardware reality ──────────────────────────────────────
  *
- * RGB parallel bus
- *   PCLK  → GPIO 21
- *   VSYNC → GPIO  3
- *   HSYNC → GPIO 46  ← shared with BL? Check your board rev!
- *   DE    → GPIO  5
- *   D0-D4 (B) → GPIO 14, 38, 18, 17, 16
- *   D5-D10(G) → GPIO 15, 13, 12, 11, 10,  9
- *   D11-D15(R)→ GPIO  8,  7,  6,  5,  4
+ *   Most ESP32 LCD boards wire the LCD controller over a direct SPI bus.
+ *   This board cannot — all GPIOs are consumed by the 16-bit RGB data bus.
  *
- * NOTE: Pin numbers above are from LILYGO's open-source schematic for the
- * T-RGB v1.1. Always verify against your specific board revision's schematic
- * at https://github.com/Xinyuan-LilyGO/LilyGo-T-RGB before flashing.
- * ──────────────────────────────────────────────────────────────────────────
+ *   Instead the board uses an XL9555 I2C GPIO expander (16 pins, address 0x20)
+ *   on I2C SDA=GPIO8, SCL=GPIO48. The LCD SPI pins (CS, MOSI, SCLK, RST) are
+ *   XL9555 outputs, NOT ESP32 GPIOs.
+ *
+ *   The RGB parallel bus control pins are:
+ *     PCLK  → GPIO 42   VSYNC → GPIO 41   HSYNC → GPIO 47
+ *     DE    → GPIO 45   BL    → GPIO 46
+ *
+ *   The 16 data pins (RGB565 on an 18-bit physical bus — 2 LSBs unconnected):
+ *     Red[5:1]  → GPIO {2,3,5,6,7}
+ *     Green[5:0]→ GPIO {9,10,11,12,13,14}
+ *     Blue[5:1] → GPIO {15,16,17,18,21}
+ *
+ * Reference: https://github.com/Xinyuan-LilyGO/LilyGo-T-RGB (MIT licence)
  */
 
+#include "xl9555.h"
 #include "st7701s.h"
 #include "lcd_panel.h"
 #include "pomodoro.h"
@@ -51,30 +54,6 @@
 #include "freertos/task.h"
 
 static const char *TAG = "main";
-
-/* ── Pin definitions ────────────────────────────────────────────────────────
- * Centralise all board-specific constants here so the rest of the code
- * is hardware-agnostic.
- */
-
-/* SPI command bus */
-#define PIN_SPI_CS    39
-#define PIN_SPI_SCLK  48
-#define PIN_SPI_MOSI  47
-#define PIN_RESET     40
-#define PIN_BL        46
-
-/* RGB parallel bus */
-#define PIN_PCLK   21
-#define PIN_VSYNC   3
-#define PIN_HSYNC  46   /* verify schematic — may differ on your rev */
-#define PIN_DE      5
-
-/* Data bus: B[4:0], G[5:0], R[4:0] → 16 total */
-#define RGB_DATA_PINS  \
-    14, 38, 18, 17, 16,      /* B4..B0  */ \
-    15, 13, 12, 11, 10,  9,  /* G5..G0  */ \
-     8,  7,  6,  5,  4       /* R4..R0  */
 
 /* ── Display task ───────────────────────────────────────────────────────────
  *
@@ -124,36 +103,26 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "=== Pomodoro Timer boot ===");
 
-    /* 1. ST7701S init sequence (SPI) */
-    st7701s_io_config_t lcd_io = {
-        .spi_cs   = PIN_SPI_CS,
-        .spi_sclk = PIN_SPI_SCLK,
-        .spi_mosi = PIN_SPI_MOSI,
-        .reset    = PIN_RESET,
-        .backlight = PIN_BL,
-    };
-    ESP_ERROR_CHECK(st7701s_init(&lcd_io));
+    /* 1. XL9555 I2C GPIO expander — must come first, everything depends on it */
+    ESP_ERROR_CHECK(xl9555_init());
 
-    /* 2. RGB panel + framebuffer */
-    lcd_panel_io_config_t panel_io = {
-        .pclk  = PIN_PCLK,
-        .vsync = PIN_VSYNC,
-        .hsync = PIN_HSYNC,
-        .de    = PIN_DE,
-        .data  = { RGB_DATA_PINS },
-    };
-    ESP_ERROR_CHECK(lcd_panel_init(&panel_io));
+    /* 2. ST7701S LCD controller — sends 80+ register writes via XL9555 SPI,
+     *    then enables the backlight. Takes ~1-2 s (I2C bit-bang is slow). */
+    ESP_ERROR_CHECK(st7701s_init());
 
-    /* Initial screen fill so we don't show garbage while Pomodoro inits */
+    /* 3. RGB DMA panel — pins and timing are hardcoded in lcd_panel.c */
+    ESP_ERROR_CHECK(lcd_panel_init());
+
+    /* Initial screen fill — prevents showing garbage from uninitialised PSRAM */
     display_clear(COLOR_WHITE);
 
-    /* 3. Pomodoro state machine + 1-second timer */
+    /* 4. Pomodoro state machine + 1-second timer */
     pomo_init();
 
-    /* 4. Input: configure buttons, start polling task */
+    /* 5. Input: configure GPIO 0 button, start polling task */
     ESP_ERROR_CHECK(input_init());
 
-    /* 5. Display rendering task */
+    /* 6. Display rendering task */
     xTaskCreate(
         display_task,
         "display",

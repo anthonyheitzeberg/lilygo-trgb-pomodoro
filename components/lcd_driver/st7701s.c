@@ -1,251 +1,247 @@
 /**
  * @file st7701s.c
- * @brief ST7701S initialization sequence over 3-wire SPI.
+ * @brief ST7701S init via XL9555 bit-bang SPI for LILYGO T-RGB 2.1".
  *
- * Learning notes are inline — read them top to bottom for a tour of
- * how SPI peripheral init works in ESP-IDF.
+ * Learning notes are inline throughout this file.
  */
 
 #include "st7701s.h"
+#include "xl9555.h"
 
-#include <string.h>
 #include "driver/gpio.h"
-#include "driver/spi_master.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "st7701s";
 
-/* ── Helpers ────────────────────────────────────────────────────────────────
- *
- * The ST7701S uses a simple 9-bit SPI protocol:
- *   bit[8]   = 0 → command byte follows
- *   bit[8]   = 1 → data byte follows
- *
- * We achieve this by treating the D/C flag as the MSB of a 9-bit word
- * and using SPI_TRANS_USE_TXDATA for small payloads (avoids malloc).
- */
+/* ── Board constants ────────────────────────────────────────────────────────*/
 
-#define CMD  0   // bit[8] = 0
-#define DATA 1   // bit[8] = 1
+/** GPIO driving the backlight LED driver IC (SY-series pulse-count dimmer). */
+#define PIN_BL   46
 
-/**
- * @brief Send one 9-bit word (command or data) over SPI.
+/* ── Bit-banged 9-bit SPI via XL9555 ────────────────────────────────────────
  *
- * Learning note ─────────────────────────────────────────────────────────────
- *   spi_transaction_t is the ESP-IDF struct that describes one SPI transfer.
- *   Fields we use:
- *     .flags        = SPI_TRANS_USE_TXDATA  → data lives in the struct itself,
- *                                             no heap allocation needed.
- *     .length       = number of BITS to send (not bytes!).
- *     .tx_data[]    = up to 4 bytes of inline payload.
- *   spi_device_polling_transmit() blocks until the transfer is done —
- *   perfect for a one-time init sequence where we don't need async.
+ * Learning note — why bit-bang and not hardware SPI? ─────────────────────────
+ *
+ *   On the LILYGO T-RGB the ST7701S SPI pins (CS, MOSI, SCLK) are wired to
+ *   the XL9555 I2C GPIO expander, NOT to ESP32 GPIO pins. There are no spare
+ *   ESP32 GPIOs — every pin is consumed by the 16-bit RGB data bus.
+ *
+ *   Bit-banging means we emulate SPI in software: we toggle individual XL9555
+ *   outputs (via I2C writes) to produce the CS / clock / data signals.
+ *
+ *   Performance trade-off:
+ *     Hardware SPI  → ~10 ns per bit (50+ MHz)
+ *     Bit-bang here → ~5 µs per bit (I2C 400 kHz overhead)
+ *   For a one-time init sequence of ~80 register writes ≈ 1 second. Fine.
  * ────────────────────────────────────────────────────────────────────────────
  */
-static void send_9bit(spi_device_handle_t spi, uint8_t dc, uint8_t byte)
+
+/**
+ * @brief Send one 9-bit SPI frame: bit[8]=dc, bits[7:0]=byte.
+ *
+ * SPI mode 0 (CPOL=0, CPHA=0):
+ *   - SCLK idles LOW.
+ *   - Data is placed on MOSI before the rising edge of SCLK.
+ *   - Data is captured on the rising edge.
+ *
+ * Bit order: MSB first (bit 8 goes first on the wire).
+ */
+static void spi_send_9bit(uint8_t dc, uint8_t byte)
 {
-    /* Pack the D/C bit + 8 data bits into a 16-bit word, MSB first.
-     * We'll send 9 bits total. */
+    /* Pack D/C flag + 8-bit payload into a 9-bit value */
     uint16_t word = ((uint16_t)dc << 8) | byte;
 
-    spi_transaction_t t = {
-        .flags  = SPI_TRANS_USE_TXDATA,
-        .length = 9,                        /* 9 bits */
-        /* tx_data is a uint8_t[4] union — store our 9-bit word big-endian */
-        .tx_data = {
-            (uint8_t)(word >> 1),           /* upper 8 bits  */
-            (uint8_t)(word << 7),           /* lower 1 bit, shifted to MSB */
-            0, 0
-        },
-    };
+    /* Assert CS (active LOW) */
+    xl9555_set_level(XL9555_IO_LCD_CS, false);
 
-    /*
-     * Alternative mental model: think of it as sending 0x0_XY where
-     * X = dc and Y = byte, spread across 9 clock edges.
-     */
-    ESP_ERROR_CHECK(spi_device_polling_transmit(spi, &t));
+    /* Shift out 9 bits, MSB first */
+    for (int bit = 8; bit >= 0; bit--) {
+        bool mosi = (word >> bit) & 1u;
+
+        /*
+         * Step 1: put data on MOSI while SCLK is LOW.
+         * Step 2: raise SCLK — the ST7701S samples MOSI on this edge.
+         * Step 3: lower SCLK back (implicit: next iteration starts with SCLK=0).
+         *
+         * Each xl9555_set_level() call flushes one I2C byte to hardware,
+         * so "MOSI then SCLK" == two I2C writes per bit.
+         */
+        xl9555_set_level(XL9555_IO_LCD_MOSI, mosi);
+        xl9555_set_level(XL9555_IO_LCD_SCLK, true);
+        xl9555_set_level(XL9555_IO_LCD_SCLK, false);
+    }
+
+    /* Deassert CS */
+    xl9555_set_level(XL9555_IO_LCD_CS, true);
 }
 
-static inline void write_cmd(spi_device_handle_t spi, uint8_t cmd)
-{
-    send_9bit(spi, CMD, cmd);
-}
+static inline void spi_cmd(uint8_t cmd)   { spi_send_9bit(0, cmd); }
+static inline void spi_data(uint8_t data) { spi_send_9bit(1, data); }
 
-static inline void write_data(spi_device_handle_t spi, uint8_t data)
-{
-    send_9bit(spi, DATA, data);
-}
-
-/* ── Init sequence ──────────────────────────────────────────────────────────
+/* ── ST7701S init command table ─────────────────────────────────────────────
  *
- * This is the "magic blob" every LCD driver needs — a vendor-specific list
- * of register writes that configure timing, gamma, power rails, etc.
- * Values come from LILYGO's reference firmware and the ST7701S datasheet.
+ * Learning note — register init tables ──────────────────────────────────────
  *
- * Format: {CMD_OR_DATA, value}
- *   CMD_OR_DATA = 0 → command register address
- *   CMD_OR_DATA = 1 → data byte for the previous command
+ *   Every LCD controller needs a "magic blob" — a vendor-supplied sequence of
+ *   register writes that configure:
+ *     • Power supply voltages (VCOM, AVDD, VGH/VGL)
+ *     • Gamma curve correction (positive and negative gamma)
+ *     • Gate/Source driver timing (GIP)
+ *     • Interface format (RGB565 vs RGB666)
+ *     • Display on/off, inversion, etc.
+ *
+ *   These values come directly from LILYGO's reference firmware (open source,
+ *   MIT licence). The ST7701S datasheet explains what each register does.
+ *
+ * Table format:
+ *   cmd       = register address (sent as 9-bit frame with D/C=0)
+ *   data[]    = data bytes (each sent with D/C=1)
+ *   n         = number of data bytes; 0x80 flag means "delay 100 ms after"
+ *   0xFF,0    = end-of-table sentinel
+ * ────────────────────────────────────────────────────────────────────────────
  */
-typedef struct { uint8_t dc; uint8_t val; } init_cmd_t;
+typedef struct {
+    uint8_t cmd;
+    uint8_t data[16];
+    uint8_t n;   /* lower 5 bits = byte count; bit 7 = add 100 ms delay */
+} lcd_reg_t;
 
-static const init_cmd_t ST7701S_INIT_SEQ[] = {
-    /* ── Page 1 commands ── */
-    {CMD,  0xFF}, {DATA, 0x77}, {DATA, 0x01}, {DATA, 0x00},
-    {DATA, 0x00}, {DATA, 0x10},
+static const lcd_reg_t ST7701S_INIT[] = {
+    /* ── Page 1: gamma + power ─────────────────────────────────────── */
+    {0xFF, {0x77,0x01,0x00,0x00,0x10}, 0x05},
+    {0xC0, {0x3B,0x00},                0x02},  /* Line Number = 0x3B → 480 lines */
+    {0xC1, {0x0B,0x02},                0x02},  /* VBP, VFP */
+    {0xC2, {0x07,0x02},                0x02},  /* PCLK inversion */
+    {0xCC, {0x10},                     0x01},
+    {0xCD, {0x08},                     0x01},  /* RGB666 CDI setting */
 
-    {CMD,  0xC0}, {DATA, 0x3B}, {DATA, 0x00},
-    {CMD,  0xC1}, {DATA, 0x0D}, {DATA, 0x02},
-    {CMD,  0xC2}, {DATA, 0x31}, {DATA, 0x05},
-    {CMD,  0xCD}, {DATA, 0x00},
+    /* Positive gamma (16 bytes) */
+    {0xB0, {0x00,0x11,0x16,0x0E,0x11,0x06,0x05,0x09,
+            0x08,0x21,0x06,0x13,0x10,0x29,0x31,0x18}, 0x10},
+    /* Negative gamma (16 bytes) */
+    {0xB1, {0x00,0x11,0x16,0x0E,0x11,0x07,0x05,0x09,
+            0x09,0x21,0x05,0x13,0x11,0x2A,0x31,0x18}, 0x10},
 
-    /* Positive voltage gamma */
-    {CMD,  0xB0},
-    {DATA, 0x00}, {DATA, 0x11}, {DATA, 0x18}, {DATA, 0x0E},
-    {DATA, 0x11}, {DATA, 0x06}, {DATA, 0x07}, {DATA, 0x08},
-    {DATA, 0x07}, {DATA, 0x22}, {DATA, 0x04}, {DATA, 0x12},
-    {DATA, 0x0F}, {DATA, 0xAA}, {DATA, 0x31}, {DATA, 0x18},
+    /* ── Page 2: power control ──────────────────────────────────────── */
+    {0xFF, {0x77,0x01,0x00,0x00,0x11}, 0x05},
+    {0xB0, {0x6D}, 0x01},  /* Positive VOP */
+    {0xB1, {0x37}, 0x01},  /* Negative VOP */
+    {0xB2, {0x81}, 0x01},
+    {0xB3, {0x80}, 0x01},
+    {0xB5, {0x43}, 0x01},  /* VGL clamp */
+    {0xB7, {0x85}, 0x01},
+    {0xB8, {0x20}, 0x01},
+    {0xC1, {0x78}, 0x01},
+    {0xC2, {0x78}, 0x01},
+    {0xC3, {0x8C}, 0x01},
+    {0xD0, {0x88}, 0x01},  /* Power-on sequence */
 
-    /* Negative voltage gamma */
-    {CMD,  0xB1},
-    {DATA, 0x00}, {DATA, 0x11}, {DATA, 0x19}, {DATA, 0x0E},
-    {DATA, 0x12}, {DATA, 0x07}, {DATA, 0x08}, {DATA, 0x08},
-    {DATA, 0x08}, {DATA, 0x22}, {DATA, 0x04}, {DATA, 0x11},
-    {DATA, 0x11}, {DATA, 0xA9}, {DATA, 0x32}, {DATA, 0x18},
+    /* ── Page 2: GIP source/gate timing ────────────────────────────── */
+    {0xE0, {0x00,0x00,0x02},                                           0x03},
+    {0xE1, {0x03,0xA0,0x00,0x00,0x04,0xA0,0x00,0x00,0x00,0x20,0x20}, 0x0B},
+    {0xE2, {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00},                                           0x0D},
+    {0xE3, {0x00,0x00,0x11,0x00},                                      0x04},
+    {0xE4, {0x22,0x00},                                                0x02},
+    {0xE5, {0x05,0xEC,0xA0,0xA0,0x07,0xEE,0xA0,0xA0,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                  0x10},
+    {0xE6, {0x00,0x00,0x11,0x00},                                      0x04},
+    {0xE7, {0x22,0x00},                                                0x02},
+    {0xE8, {0x06,0xED,0xA0,0xA0,0x08,0xEF,0xA0,0xA0,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                  0x10},
+    {0xEB, {0x00,0x00,0x40,0x40,0x00,0x00,0x00},                       0x07},
+    {0xED, {0xFF,0xFF,0xFF,0xBA,0x0A,0xBF,0x45,0xFF,
+            0xFF,0x54,0xFB,0xA0,0xAB,0xFF,0xFF,0xFF},                  0x10},
+    {0xEF, {0x10,0x0D,0x04,0x08,0x3F,0x1F},                           0x06},
 
-    /* ── Page 2 commands ── */
-    {CMD,  0xFF}, {DATA, 0x77}, {DATA, 0x01}, {DATA, 0x00},
-    {DATA, 0x00}, {DATA, 0x11},
+    /* ── Page 3 ─────────────────────────────────────────────────────── */
+    {0xFF, {0x77,0x01,0x00,0x00,0x13}, 0x05},
+    {0xEF, {0x08},                      0x01},
 
-    {CMD,  0xB0}, {DATA, 0x60},   /* Positive voltage */
-    {CMD,  0xB1}, {DATA, 0x30},   /* Negative voltage */
-    {CMD,  0xB2}, {DATA, 0x87},
-    {CMD,  0xB3}, {DATA, 0x80},
-    {CMD,  0xB5}, {DATA, 0x49},
-    {CMD,  0xB7}, {DATA, 0x85},
-    {CMD,  0xB8}, {DATA, 0x21},
-    {CMD,  0xC1}, {DATA, 0x78},
-    {CMD,  0xC2}, {DATA, 0x78},
+    /* ── Page 0: standard MIPI commands ────────────────────────────── */
+    {0xFF, {0x77,0x01,0x00,0x00,0x00}, 0x05},
+    {0x36, {0x08},                      0x01},  /* Memory Access Ctrl */
+    {0x3A, {0x66},                      0x01},  /* Pixel format: RGB666 on-wire
+                                                 *   (ESP32 sends 16-bit / RGB565
+                                                 *    but the physical bus is 18-bit.
+                                                 *    0x66 = MCU 18-bit, RGB 18-bit.
+                                                 *    The pin mapping skips the LSB
+                                                 *    of R and B naturally.) */
+    {0x11, {0x00}, 0x80},  /* Sleep Out — 0x80 flag → 100 ms delay */
+    {0x29, {0x00}, 0x80},  /* Display On */
 
-    /* Power-on sequence delay */
-    {CMD,  0xD0}, {DATA, 0x88},
-
-    /* ── Page 3 (GIP timing) ── */
-    {CMD,  0xFF}, {DATA, 0x77}, {DATA, 0x01}, {DATA, 0x00},
-    {DATA, 0x00}, {DATA, 0x12},
-
-    {CMD,  0xD1}, {DATA, 0x81},
-    {CMD,  0xD2}, {DATA, 0x06},
-
-    /* ── Page 0 / standard commands ── */
-    {CMD,  0xFF}, {DATA, 0x77}, {DATA, 0x01}, {DATA, 0x00},
-    {DATA, 0x00}, {DATA, 0x00},
-
-    {CMD,  0x36}, {DATA, 0x00},   /* Memory Access Control (rotation = 0°) */
-    {CMD,  0x3A}, {DATA, 0x60},   /* Interface pixel format: 18-bit RGB */
-
-    {CMD,  0x11},                 /* Sleep Out — must wait 120 ms after */
+    {0x00, {0x00}, 0xFF},  /* End sentinel */
 };
+
+/* ── Backlight ───────────────────────────────────────────────────────────────
+ *
+ * The backlight LED driver uses a pulse-count dimming protocol:
+ *   • Initial rising edge from 0 V → sets brightness to full (16/16).
+ *   • Each additional LOW→HIGH toggle decrements one brightness step.
+ *   • Driving LOW for >3 ms resets to off.
+ *
+ * To get maximum brightness from cold start:
+ *   1. Drive LOW (off / reset state)
+ *   2. Wait >3 ms
+ *   3. Drive HIGH once → jumps to maximum brightness (step 16)
+ */
+static void backlight_on(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << PIN_BL),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+
+    gpio_set_level(PIN_BL, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));   /* > 3 ms: reset the dimmer IC */
+    gpio_set_level(PIN_BL, 1);     /* first rising edge → full brightness */
+}
 
 /* ── Public API ─────────────────────────────────────────────────────────────*/
 
-esp_err_t st7701s_init(const st7701s_io_config_t *io)
+esp_err_t st7701s_init(void)
 {
-    ESP_LOGI(TAG, "Initialising ST7701S...");
+    ESP_LOGI(TAG, "Initialising ST7701S (via XL9555 bit-bang SPI)...");
 
-    /* ── 1. Hardware reset ─────────────────────────────────────────────────
+    /* ── 1. Hardware reset (via XL9555 IO6) ─────────────────────────────────
      *
-     * Learning note: gpio_config() is the preferred way to configure a pin.
-     * Always fill the entire gpio_config_t — avoid partial initialisation.
+     * The reset pin is active LOW. Pull it LOW for 20 ms, then HIGH.
+     * The ST7701S datasheet requires ≥10 µs active reset; we use 20 ms to be
+     * generous. After release, the chip needs 120 ms to stabilise its internal
+     * oscillator before accepting SPI commands.
      */
-    if (io->reset >= 0) {
-        gpio_config_t rst_cfg = {
-            .pin_bit_mask = (1ULL << io->reset),
-            .mode         = GPIO_MODE_OUTPUT,
-            .pull_up_en   = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type    = GPIO_INTR_DISABLE,
-        };
-        ESP_ERROR_CHECK(gpio_config(&rst_cfg));
-
-        gpio_set_level(io->reset, 0);
-        vTaskDelay(pdMS_TO_TICKS(10));   /* hold reset low ≥ 10 ms */
-        gpio_set_level(io->reset, 1);
-        vTaskDelay(pdMS_TO_TICKS(120));  /* wait for internal oscillator */
-    }
-
-    /* ── 2. Configure backlight ────────────────────────────────────────────*/
-    if (io->backlight >= 0) {
-        gpio_config_t bl_cfg = {
-            .pin_bit_mask = (1ULL << io->backlight),
-            .mode         = GPIO_MODE_OUTPUT,
-            .pull_up_en   = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type    = GPIO_INTR_DISABLE,
-        };
-        ESP_ERROR_CHECK(gpio_config(&bl_cfg));
-        gpio_set_level(io->backlight, 1);  /* on */
-    }
-
-    /* ── 3. Set up the SPI bus ─────────────────────────────────────────────
-     *
-     * Learning note ─────────────────────────────────────────────────────────
-     *   ESP-IDF SPI setup is two-step:
-     *     a) spi_bus_initialize() — configures the physical pins once.
-     *     b) spi_bus_add_device()  — attaches a logical device (with its own
-     *                                CS, clock speed, and mode) to that bus.
-     *   You can have multiple devices on one bus.
-     *
-     *   SPI_HOST selection:
-     *     SPI2_HOST (HSPI) and SPI3_HOST (VSPI) are the two user-facing hosts.
-     *     We use SPI2_HOST for the LCD command bus.
-     *
-     *   DMA channel:
-     *     SPI_DMA_CH_AUTO lets IDF pick the DMA channel. For an init-only bus
-     *     that only sends tiny 9-bit frames we could also use SPI_DMA_DISABLED,
-     *     but AUTO is safer for future use.
-     * ────────────────────────────────────────────────────────────────────────
-     */
-    spi_bus_config_t buscfg = {
-        .mosi_io_num     = io->spi_mosi,
-        .miso_io_num     = -1,           /* LCD is write-only on this bus */
-        .sclk_io_num     = io->spi_sclk,
-        .quadwp_io_num   = -1,
-        .quadhd_io_num   = -1,
-        .max_transfer_sz = 4,            /* we send at most 4 bytes at a time */
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 1 * 1000 * 1000,  /* 1 MHz — conservative for init */
-        .mode           = 0,                 /* SPI mode 0: CPOL=0, CPHA=0   */
-        .spics_io_num   = io->spi_cs,
-        .queue_size     = 1,
-        /* No pre/post callbacks needed for synchronous polling transfers */
-    };
-    spi_device_handle_t spi;
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &spi));
-
-    /* ── 4. Send init sequence ─────────────────────────────────────────────*/
-    size_t n = sizeof(ST7701S_INIT_SEQ) / sizeof(ST7701S_INIT_SEQ[0]);
-    for (size_t i = 0; i < n; i++) {
-        send_9bit(spi, ST7701S_INIT_SEQ[i].dc, ST7701S_INIT_SEQ[i].val);
-    }
-
-    /* Sleep Out requires 120 ms before sending further commands */
+    xl9555_set_level(XL9555_IO_LCD_RST, false);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    xl9555_set_level(XL9555_IO_LCD_RST, true);
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* Display On */
-    write_cmd(spi, 0x29);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    /* ── 2. Send init register table ────────────────────────────────────────*/
+    for (int i = 0; ST7701S_INIT[i].n != 0xFF; i++) {
+        const lcd_reg_t *r = &ST7701S_INIT[i];
+        uint8_t count = r->n & 0x1F;   /* lower 5 bits = byte count */
+        bool    delay = r->n & 0x80;   /* bit 7 = insert 100 ms delay */
 
-    ESP_LOGI(TAG, "ST7701S ready");
+        spi_cmd(r->cmd);
+        for (int j = 0; j < count; j++) {
+            spi_data(r->data[j]);
+        }
 
-    /*
-     * We intentionally leave the SPI device attached. In a real product you
-     * might release it here since the RGB peripheral takes over from now on.
-     * Keeping it lets you send runtime commands (e.g. brightness via WRDISBV).
-     */
+        if (delay) {
+            vTaskDelay(pdMS_TO_TICKS(120));
+        }
+    }
+
+    ESP_LOGI(TAG, "ST7701S init done");
+
+    /* ── 3. Turn on backlight ───────────────────────────────────────────────*/
+    backlight_on();
+    ESP_LOGI(TAG, "Backlight on");
+
     return ESP_OK;
 }

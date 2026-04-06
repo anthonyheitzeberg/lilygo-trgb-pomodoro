@@ -2,55 +2,60 @@
 
 /**
  * @file st7701s.h
- * @brief Low-level ST7701S LCD controller driver.
+ * @brief ST7701S LCD controller init driver for LILYGO T-RGB 2.1".
  *
- * The LILYGO T-RGB board wires the ST7701S over:
- *   - SPI (QSPI / 3-wire SPI) for command/init sequences
- *   - RGB parallel interface for pixel data (16-bit RGB565)
+ * ── Architecture on this board ───────────────────────────────────────────────
  *
- * This layer owns only the SPI init sequence. Pixel data is pushed
- * automatically by the ESP32-S3 RGB LCD peripheral via DMA — we never
- * manually write pixels here.
+ *   Most ESP32 LCD boards wire the ST7701S SPI init bus directly to free
+ *   GPIOs. The LILYGO T-RGB does NOT — there are no spare GPIOs. Instead:
  *
- * Learning note ──────────────────────────────────────────────────────────────
- *   The ST7701S has two buses:
- *     1. A slow SPI bus used ONCE at boot to send ~30 init commands.
- *     2. A fast RGB parallel bus used every frame for pixel data.
- *   ESP-IDF's `esp_lcd_panel_rgb` driver manages bus #2 entirely for you.
- *   We only need to touch bus #1 in this file.
- * ────────────────────────────────────────────────────────────────────────────
+ *     ESP32-S3 ──(I2C)──► XL9555 GPIO expander ──(bit-bang SPI)──► ST7701S
+ *
+ *   So st7701s_init() drives the SPI init sequence *through* the XL9555 driver
+ *   (xl9555.h), which in turn talks to the XL9555 over I2C.
+ *
+ * ── Two-bus design of the ST7701S ────────────────────────────────────────────
+ *
+ *   Bus 1 — SPI (3-wire, 9-bit): used ONCE at boot to send ~80 register
+ *            writes that configure timing, gamma, and power rails.
+ *   Bus 2 — RGB parallel (16-bit): used every frame for pixel data, managed
+ *            entirely by the ESP32-S3 LCD DMA engine (see lcd_panel.h).
+ *
+ * ── 9-bit SPI frame format ────────────────────────────────────────────────────
+ *
+ *   Each frame is 9 bits, MSB first:
+ *     bit 8 = D/C (0 = command register address, 1 = data byte)
+ *     bit 7-0 = payload byte
+ *
+ *   CS goes LOW for the duration of each 9-bit frame.
+ *
+ * ── Backlight ────────────────────────────────────────────────────────────────
+ *
+ *   GPIO 46 drives a backlight LED driver (SY series) using a custom
+ *   pulse-counting protocol:
+ *     • Pull LOW for >3 ms → reset to minimum brightness (step 1).
+ *     • Each rising edge increments one brightness step (max 16 steps).
+ *     • Drive HIGH and leave it → max brightness immediately from off-state.
+ *
+ *   st7701s_init() sets maximum backlight brightness automatically.
  */
 
+#pragma once
+
 #include "esp_err.h"
-#include "driver/spi_master.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** All GPIO numbers for the LILYGO T-RGB 2.1 inch board. */
-typedef struct {
-    /* SPI command bus (3-wire, used only for init) */
-    int spi_cs;     ///< Chip-select for the init SPI bus
-    int spi_sclk;   ///< Clock
-    int spi_mosi;   ///< MOSI (data out to LCD)
-
-    /* Hardware reset */
-    int reset;      ///< Active-low reset pin (-1 if not wired)
-
-    /* Backlight (PWM or plain GPIO) */
-    int backlight;  ///< -1 if not used
-} st7701s_io_config_t;
-
 /**
- * @brief Send the full ST7701S initialization command sequence over SPI.
+ * @brief Send the ST7701S init sequence and enable the backlight.
  *
- * Call this ONCE, before you start the RGB peripheral.
+ * Must be called once, after xl9555_init(), before lcd_panel_init().
  *
- * @param io  Pin configuration for the command SPI bus.
- * @return    ESP_OK on success.
+ * @return ESP_OK on success.
  */
-esp_err_t st7701s_init(const st7701s_io_config_t *io);
+esp_err_t st7701s_init(void);
 
 #ifdef __cplusplus
 }

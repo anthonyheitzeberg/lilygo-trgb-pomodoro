@@ -33,28 +33,16 @@ extern "C" {
 #define LCD_H_RES   480   ///< Horizontal resolution in pixels
 #define LCD_V_RES   480   ///< Vertical resolution in pixels
 
-/** RGB parallel bus pin map for the LILYGO T-RGB 2.1" board. */
-typedef struct {
-    /* Control signals */
-    int pclk;   ///< Pixel clock
-    int vsync;  ///< Vertical sync
-    int hsync;  ///< Horizontal sync
-    int de;     ///< Data enable
-
-    /* 16-bit RGB data bus (R[4:0], G[5:0], B[4:0]) */
-    int data[16];
-} lcd_panel_io_config_t;
-
 /**
  * @brief Initialise the RGB LCD panel and allocate the framebuffer.
  *
+ * Pins and timing are hardcoded for the LILYGO T-RGB 2.1" board.
  * After this call the DMA engine is running and refreshing the display.
  * Draw into the framebuffer returned by lcd_panel_get_fb().
  *
- * @param io  Pin configuration for the RGB bus.
- * @return    ESP_OK on success.
+ * @return ESP_OK on success.
  */
-esp_err_t lcd_panel_init(const lcd_panel_io_config_t *io);
+esp_err_t lcd_panel_init(void);
 
 /**
  * @brief Return a pointer to the RGB565 framebuffer.
