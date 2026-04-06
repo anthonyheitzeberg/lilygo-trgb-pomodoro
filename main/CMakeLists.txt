@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "pomodoro.c"
+        "display.c"
+        "input.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        lcd_driver
+        driver
+        esp_timer
+        log
+        freertos
+)
